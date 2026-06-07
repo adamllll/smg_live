@@ -24,6 +24,7 @@
     const VIDEO_RESET_EVENTS = ['loadstart', 'waiting', 'stalled', 'emptied'];
     const watchedVideos = new WeakSet();
     let fullscreenFallbackTarget = null;
+    let cssFullscreenFallbackPlayer = null;
     let lastFullscreenActionAt = 0;
     function injectStyle(cssText) {
         const appendStyle = () => {
@@ -200,6 +201,18 @@
         if (!target) {
             return;
         }
+        const player = component?.player;
+        if (player && typeof player.getCssFullscreen === 'function') {
+            try {
+                player.getCssFullscreen(target);
+                cssFullscreenFallbackPlayer = player;
+                syncFullscreenButtonState(component, true);
+                console.log('[SMGTV] 已启用 xgplayer CSS 全屏兜底');
+                return;
+            } catch (e) {
+                console.warn('[SMGTV] xgplayer CSS 全屏失败，使用样式兜底', e);
+            }
+        }
         exitFallbackFullscreen(component);
         fullscreenFallbackTarget = target;
         target.classList.add(FULLSCREEN_TARGET_CLASS);
@@ -208,6 +221,15 @@
         console.log('[SMGTV] 已启用 CSS 全屏兜底');
     }
     function exitFallbackFullscreen(component) {
+        const player = component?.player || cssFullscreenFallbackPlayer;
+        if (cssFullscreenFallbackPlayer && player && typeof player.exitCssFullscreen === 'function') {
+            try {
+                player.exitCssFullscreen();
+            } catch (e) {
+                console.warn('[SMGTV] 退出 xgplayer CSS 全屏失败', e);
+            }
+        }
+        cssFullscreenFallbackPlayer = null;
         if (fullscreenFallbackTarget) {
             fullscreenFallbackTarget.classList.remove(FULLSCREEN_TARGET_CLASS);
             fullscreenFallbackTarget = null;
@@ -216,7 +238,9 @@
         syncFullscreenButtonState(component, false);
     }
     function isFallbackFullscreen() {
-        return !!document.body?.classList.contains(FULLSCREEN_FALLBACK_CLASS);
+        return !!document.body?.classList.contains(FULLSCREEN_FALLBACK_CLASS) ||
+            !!cssFullscreenFallbackPlayer?.cssfullscreen ||
+            !!cssFullscreenFallbackPlayer?.isCssfullScreen;
     }
     function callFullscreenMethod(fn) {
         try {
@@ -397,18 +421,61 @@
     }
     .${FULLSCREEN_TARGET_CLASS} {
         background: #000 !important;
+        box-sizing: border-box !important;
         height: 100vh !important;
         inset: 0 !important;
+        margin: 0 !important;
         max-height: none !important;
         max-width: none !important;
+        min-height: 100vh !important;
+        min-width: 100vw !important;
+        padding: 0 !important;
         position: fixed !important;
+        transform: none !important;
         width: 100vw !important;
         z-index: 2147483647 !important;
     }
-    .${FULLSCREEN_TARGET_CLASS} video {
+    .${FULLSCREEN_TARGET_CLASS}.xgplayer,
+    .${FULLSCREEN_TARGET_CLASS} .xgplayer {
         height: 100% !important;
-        object-fit: contain !important;
+        inset: 0 !important;
+        margin: 0 !important;
+        max-height: none !important;
+        max-width: none !important;
+        padding: 0 !important;
+        padding-top: 0 !important;
+        position: absolute !important;
+        transform: none !important;
         width: 100% !important;
+    }
+    .${FULLSCREEN_TARGET_CLASS} .xgplayer-screen-container,
+    .${FULLSCREEN_TARGET_CLASS} xg-video-container.xg-video-container,
+    .${FULLSCREEN_TARGET_CLASS} .xg-video-container {
+        bottom: 0 !important;
+        display: block !important;
+        height: 100% !important;
+        inset: 0 !important;
+        position: absolute !important;
+        width: 100% !important;
+    }
+    .${FULLSCREEN_TARGET_CLASS} video,
+    .${FULLSCREEN_TARGET_CLASS} canvas,
+    .${FULLSCREEN_TARGET_CLASS} live-video {
+        bottom: 0 !important;
+        height: 100% !important;
+        left: 0 !important;
+        max-height: none !important;
+        max-width: none !important;
+        object-fit: contain !important;
+        position: absolute !important;
+        right: 0 !important;
+        top: 0 !important;
+        transform: none !important;
+        width: 100% !important;
+    }
+    .${FULLSCREEN_TARGET_CLASS} .xgplayer-controls,
+    .${FULLSCREEN_TARGET_CLASS} .xg-top-bar {
+        z-index: 2147483647 !important;
     }
     `);
     
