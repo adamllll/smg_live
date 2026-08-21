@@ -1,0 +1,5 @@
+# Claude Code 项目约束（本地协作配置，不随脚本分发）
+.claude/
+
+# Playwright MCP 调试快照
+.playwright-mcp/

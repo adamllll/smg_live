@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.8
+// @version          0.9
 // @description      打开网页即可收看SMGTV，并解除试看倒计时与切页暂停等限制
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
 // @icon             https://live.kankanews.com/favicon.ico
-// @updateURL        https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
-// @downloadURL      https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
+// @updateURL        https://raw.githubusercontent.com/adamllll/smg_live/refs/heads/main/smg_fivestar.user.js
+// @downloadURL      https://raw.githubusercontent.com/adamllll/smg_live/refs/heads/main/smg_fivestar.user.js
 // @grant            none
 // @run-at           document-start
 // ==/UserScript==
@@ -325,12 +325,15 @@
             }
         });
     }
-    function wrapComponentMethod(component, methodName, after) {
+    function wrapComponentMethod(component, methodName, after, before) {
         const original = component?.[methodName];
         if (typeof original !== 'function' || original.__smgWrapped) {
             return;
         }
         const wrapped = function() {
+            if (typeof before === 'function') {
+                try { before(this, arguments); } catch (e) {}
+            }
             const result = original.apply(this, arguments);
             const runAfter = () => {
                 setTimeout(() => after(this), 0);
@@ -348,6 +351,68 @@
         wrapped.__smgOriginal = original;
         component[methodName] = wrapped;
     }
+    // 解除节目屏蔽字段：is_shield 控制是否创建播放器（isCopyright computed 依赖 programObj.is_shield）
+    // 注意：只改权限字段，不动 play / isOutDate（它们是时间判断，乱改会误播未来节目或走错流地址分支）
+    function unshieldProgram(program) {
+        if (!program || typeof program !== 'object') {
+            return;
+        }
+        if ('is_shield' in program) program.is_shield = 0;
+        if ('is_review' in program) program.is_review = 1;
+        if ('can_review' in program) program.can_review = 1;
+    }
+    // 回填直播流地址：被屏蔽节目（is_shield=1）的 program/detail 接口会把 channel_info.live_address 置空，
+    // 用频道级 currChannelDetail 的同名字段补齐（频道级地址始终可用），否则 initPlayer 拿到空 url 报错卡加载
+    function ensureStreamAddress(component) {
+        const detail = component?.programDetail;
+        const channel = component?.currChannelDetail;
+        if (!detail?.channel_info || !channel) {
+            return;
+        }
+        if (!detail.channel_info.live_address && channel.live_address) {
+            detail.channel_info.live_address = channel.live_address;
+        }
+        if (!detail.channel_info.shift_address && channel.shift_address) {
+            detail.channel_info.shift_address = channel.shift_address;
+        }
+    }
+    // 自愈：默认进入页面时若选中节目被屏蔽，initPlayer 已走 destroyPlayer 分支、播放器未创建。
+    // 轮询等待节目详情与频道流地址就绪后，校正屏蔽字段 + 回填流地址，再重新触发 initPlayer
+    function startPlayerRecovery(component) {
+        if (!component || component.__smgRecovery) {
+            return;
+        }
+        component.__smgRecovery = true;
+        let attempts = 0;
+        const maxAttempts = 40;
+        const timer = setInterval(() => {
+            attempts += 1;
+            if (component.player) {
+                clearInterval(timer);
+                return;
+            }
+            const ready = component.programObj?.id &&
+                component.programDetail?.channel_info &&
+                component.currChannelDetail?.live_address;
+            if (ready || attempts >= maxAttempts) {
+                clearInterval(timer);
+                if (!component.player) {
+                    unshieldProgram(component.programObj);
+                    unshieldProgram(component.programDetail);
+                    ensureStreamAddress(component);
+                    try {
+                        if (typeof component.initPlayer === 'function') {
+                            // 用 click 触发：initPlayer 在 auto 模式会抑制自动播放，click 才会执行 player.play()
+                            component.initPlayer({ changeCurrentList: false, isPlay: true, trigger: 'click' });
+                            console.log('[SMGTV] 已自愈重建播放器');
+                        }
+                    } catch (e) {
+                        console.warn('[SMGTV] 自愈重建播放器失败', e);
+                    }
+                }
+            }
+        }, 250);
+    }
     function patchComponent(component) {
         if (!component) {
             return;
@@ -358,6 +423,10 @@
             return;
         }
         component.__smgPatched = true;
+        // 首次校正：解除当前选中节目 / 详情的屏蔽状态
+        unshieldProgram(component.programObj);
+        unshieldProgram(component.playingProgramObj);
+        unshieldProgram(component.programDetail);
         if (typeof component.countdown === 'number') {
             component.countdown = 99999999;
         }
@@ -370,9 +439,10 @@
             clearTimeout(component.liveTimer);
             component.liveTimer = null;
         }
-        if (!component.player && component.programObj?.id && typeof component.playProgram === 'function') {
-            console.log('[SMGTV] 播放器已销毁，尝试重新加载节目');
-            component.playProgram();
+        // 自愈：若进入时播放器未创建（默认节目被屏蔽导致 initPlayer 走了 destroyPlayer 分支），
+        // 等节目详情 + 频道流地址就绪后回填并重新初始化播放器
+        if (!component.player && component.programObj?.id) {
+            startPlayerRecovery(component);
         }
         if (typeof component.pageVisibilityChange === 'function') {
             document.removeEventListener('visibilitychange', component.pageVisibilityChange);
@@ -386,7 +456,19 @@
             component._handlerUnload = null;
         }
         ['initPlayer', 'initNoProgramPlayer', 'initPadPlayer', 'changeProgram', 'changeChannel'].forEach(methodName => {
-            wrapComponentMethod(component, methodName, syncLoadingState);
+            wrapComponentMethod(component, methodName, syncLoadingState, (ctx, args) => {
+                // 原方法执行前校正屏蔽字段：
+                // - programObj：initPlayer 读取 isCopyright 时依赖 programObj.is_shield
+                // - 入参节目对象：changeProgram/changeChannel 会将其赋给 programObj，需在赋值前放行
+                unshieldProgram(ctx.programObj);
+                unshieldProgram(ctx.playingProgramObj);
+                unshieldProgram(ctx.programDetail);
+                if (args && args[0]) {
+                    unshieldProgram(args[0]);
+                }
+                // 回填被置空的直播流地址（F1 等屏蔽节目的核心病根）
+                ensureStreamAddress(ctx);
+            });
         });
         syncLoadingState(component);
         console.log('[SMGTV] 页面限制补丁已生效');
