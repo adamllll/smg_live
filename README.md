@@ -1,13 +1,15 @@
 <div align="center">
 
-# SMTV Live
-
-观看上海 SMGTV（看看新闻 `kankanews.com/huikan`）全部频道直播，<br>
-解除试看倒计时、切页暂停与节目屏蔽等限制
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.svg">
+  <img src="assets/banner-light.svg" alt="SMTV Live — 解除看看新闻直播与回看的观看限制">
+</picture>
 
 ![version](https://img.shields.io/badge/version-0.11-blue)
-![license](https://img.shields.io/badge/license-MIT-green)
-![userscript](https://img.shields.io/badge/Tampermonkey%20%7C%20Violentmonkey-userscript-orange)
+![license](https://img.shields.io/badge/license-MIT-grey)
+![userscript](https://img.shields.io/badge/Tampermonkey%20%7C%20Violentmonkey-userscript-grey?logo=tampermonkey&logoColor=white)
+
+[![install](https://img.shields.io/badge/%E5%AE%89%E8%A3%85%E8%84%9A%E6%9C%AC-Tampermonkey%20%7C%20Violentmonkey-2ea44f?logo=tampermonkey&logoColor=white)](https://g.geeck.eu.org/https://raw.githubusercontent.com/adamllll/smg_live/refs/heads/main/smg_fivestar.user.js)
 
 基于 [Popukok/smg_live](https://github.com/Popukok/smg_live) 维护
 
@@ -26,17 +28,13 @@
 
 ## 📥 安装
 
-需要浏览器装有 [Tampermonkey](https://tampermonkey.net/) 或 [Violentmonkey](https://violentmonkey.github.io/) 插件，点击下方链接安装即可：
-
-| 正式版 (GitHub 源) |
-| --- |
-| [![install](https://img.shields.io/badge/%E5%AE%89%E8%A3%85-%E7%82%B9%E5%87%BB%E8%BF%99%E9%87%8C-2ea44f)](https://g.geeck.eu.org/https://raw.githubusercontent.com/adamllll/smg_live/refs/heads/main/smg_fivestar.user.js) |
+需要浏览器装有 [Tampermonkey](https://tampermonkey.net/) 或 [Violentmonkey](https://violentmonkey.github.io/) 插件，点击上方绿色按钮即可安装。
 
 安装后[点击打开看看新闻](https://live.kankanews.com/huikan?id=10)，选择频道即可观看。
 
 例如收看五星体育频道 F1 比赛直播，可以跳过以下图片提示：
 
-![这是图片](https://p.statickksmg.com/cont/2023/10/08/image_1696731269_qOxBpp34.jpg "")
+![安装脚本前，频道会显示版权节目的试看限制提示](https://p.statickksmg.com/cont/2023/10/08/image_1696731269_qOxBpp34.jpg)
 
 ## 📝 更新日志
 

@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 380" role="img" aria-label="SMTV Live — 解除看看新闻直播与回看的观看限制">
+  <!-- Midnight Signal · dark：与 GitHub 暗色主题 (#0d1117) 协调的灰阶 -->
+  <g font-family="-apple-system, 'Segoe UI', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+
+    <!-- ● LIVE 台标：红点 + 宽字距小字 -->
+    <circle cx="612" cy="100" r="5" fill="#f85149"/>
+    <text x="622" y="105" font-size="13" font-weight="600" letter-spacing="5" fill="#8b949e">LIVE</text>
+
+    <!-- 主标题 -->
+    <text x="640" y="192" text-anchor="middle" font-size="72" font-weight="700" letter-spacing="2" fill="#e6edf3">SMTV Live</text>
+
+    <!-- 信号线：左段平坦（信号丢失）→ 中段脉冲（信号恢复，正中 640）→ 右段平坦 -->
+    <path d="M 340 238 H 580
+             Q 590 214 600 238 T 620 238 T 640 238 T 660 238 T 680 238
+             H 940"
+          fill="none" stroke="#30363d" stroke-width="1.5"/>
+    <!-- 脉冲段单独着色，强调「恢复」的瞬间 -->
+    <path d="M 580 238
+             Q 590 214 600 238 T 620 238 T 640 238 T 660 238 T 680 238"
+          fill="none" stroke="#f85149" stroke-width="1.5" stroke-linecap="round"/>
+
+    <!-- 示波器时间刻度：细密小齿，精密仪器感 -->
+    <path d="M 340 244 v 5 M 415 244 v 5 M 490 244 v 5 M 565 244 v 5 M 640 244 v 7 M 715 244 v 5 M 790 244 v 5 M 865 244 v 5 M 940 244 v 5"
+          stroke="#30363d" stroke-width="1"/>
+
+    <!-- tagline -->
+    <text x="640" y="292" text-anchor="middle" font-size="17" letter-spacing="1" fill="#8b949e">解除看看新闻（kankanews.com/huikan）直播与回看的观看限制</text>
+  </g>
+</svg>
