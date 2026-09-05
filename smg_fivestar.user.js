@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.10
+// @version          0.11
 // @description      打开网页即可收看SMGTV，并解除试看倒计时与切页暂停等限制
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
@@ -26,6 +26,53 @@
     let fullscreenFallbackTarget = null;
     let cssFullscreenFallbackPlayer = null;
     let lastFullscreenActionAt = 0;
+    // ===== 流地址缓存（被动捕获 + 主动取流共用）=====
+    // liveAddressCache：加密 live_address（主动经 app 接口取回或从响应捕获）
+    // streamAddressCache：channel/detail 响应里见到的 live/shift 地址（被动捕获，供空地址回补）
+    // channelShiftBaseCache / channelLiveBaseCache：播放器实际使用过的解密后 m3u8 基址（回看拼时间窗用，带 TTL）
+    const liveAddressCache = new Map();
+    const streamAddressCache = Object.create(null);
+    const channelShiftBaseCache = Object.create(null);
+    const channelLiveBaseCache = Object.create(null);
+    const SHIFT_TTL = 12 * 60 * 60 * 1000;
+    const LIVE_TTL = 3 * 60 * 60 * 1000;
+    // 日志节流：节目轮询等高频路径下避免同一日志刷屏
+    const logThrottle = Object.create(null);
+    function throttleLog(key, intervalMs, fn) {
+        const now = Date.now();
+        if ((logThrottle[key] || 0) + intervalMs > now) {
+            return;
+        }
+        logThrottle[key] = now;
+        fn();
+    }
+    // 被动捕获：channel/detail 响应中见到地址就记住（含 shift，回看备用）
+    function rememberStreamAddresses(channelId, liveAddress, shiftAddress) {
+        if (channelId == null || channelId === '') {
+            return;
+        }
+        const key = String(channelId);
+        const prev = streamAddressCache[key] || { live_address: '', shift_address: '' };
+        streamAddressCache[key] = {
+            live_address: liveAddress || prev.live_address || '',
+            shift_address: shiftAddress || prev.shift_address || ''
+        };
+    }
+    // 被动回补：目标对象地址为空时用缓存填充（live 缺则用 shift 兜底，反之亦然）
+    function fillStreamAddresses(target, channelId) {
+        if (!target) {
+            return;
+        }
+        const cached = streamAddressCache[String(channelId)] || {};
+        const channelLiveAddress = cached.live_address || cached.shift_address;
+        const channelShiftAddress = cached.shift_address || cached.live_address;
+        if (channelLiveAddress && !target.live_address) {
+            target.live_address = channelLiveAddress;
+        }
+        if (channelShiftAddress && !target.shift_address) {
+            target.shift_address = channelShiftAddress;
+        }
+    }
     function injectStyle(cssText) {
         const appendStyle = () => {
             if (document.getElementById(STYLE_ID)) {
@@ -40,6 +87,32 @@
             appendStyle();
         } else {
             document.addEventListener('DOMContentLoaded', appendStyle, { once: true });
+        }
+    }
+    // 移动端：viewport-fit=cover 让 iPhone 刘海屏全屏样式能吃到 safe-area-inset
+    function ensureViewportFitCover() {
+        const apply = () => {
+            try {
+                const meta = document.querySelector('meta[name="viewport"]');
+                if (meta) {
+                    const content = meta.getAttribute('content') || '';
+                    if (!/viewport-fit\s*=\s*cover/i.test(content)) {
+                        meta.setAttribute('content', content ? content + ', viewport-fit=cover' : 'viewport-fit=cover');
+                    }
+                    return;
+                }
+                const created = document.createElement('meta');
+                created.setAttribute('name', 'viewport');
+                created.setAttribute('content', 'width=device-width, initial-scale=1, viewport-fit=cover');
+                (document.head || document.documentElement).appendChild(created);
+            } catch (e) {
+                throttleLog('viewport-error', 5000, () => console.warn('[SMGTV] 设置 viewport-fit 失败:', e));
+            }
+        };
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', apply, { once: true });
+        } else {
+            apply();
         }
     }
     function getVueInstance(el) {
@@ -103,7 +176,39 @@
             component.isLoading = false;
             console.log('[SMGTV] 已同步播放器 loading 状态');
         }
+        // 持续自愈：播放器报错（空 url 创建的废播放器）时回填地址并重建（带次数上限，防死循环）
+        recoverPlayerIfNeeded(component);
         return isReady;
+    }
+    // 播放器媒体级报错自愈：initPlayer 用空 url 建出的播放器 video.error.code===4（媒体格式错误）
+    function recoverPlayerIfNeeded(component) {
+        if (!component || typeof component.initPlayer !== 'function' || component.__smgRecovering) {
+            return;
+        }
+        const video = getPlayerVideo(component);
+        const mediaError = video?.error;
+        if (!(component.player && mediaError && mediaError.code === 4)) {
+            return;
+        }
+        component.__smgRecoverCount = (component.__smgRecoverCount || 0) + 1;
+        if (component.__smgRecoverCount > 3) {
+            return;
+        }
+        component.__smgRecovering = true;
+        try {
+            unshieldProgram(component.programObj);
+            unshieldProgram(component.programDetail);
+            if (isLiveAddressEmpty(component)) {
+                refillLiveAddress(component);
+            } else {
+                component.initPlayer({ changeCurrentList: false, isPlay: true, trigger: 'click' });
+                console.log('[SMGTV] 已自愈重建报错播放器');
+            }
+        } catch (e) {
+            console.warn('[SMGTV] 播放器报错自愈失败', e);
+        } finally {
+            setTimeout(() => { component.__smgRecovering = false; }, 2000);
+        }
     }
     function watchPlayerVideo(component, video) {
         if (!video || watchedVideos.has(video)) {
@@ -122,13 +227,43 @@
         VIDEO_RESET_EVENTS.forEach(eventName => {
             video.addEventListener(eventName, resetReady, { passive: true });
         });
+        // iOS 原生视频全屏的按钮态同步
+        video.addEventListener('webkitbeginfullscreen', () => syncFullscreenButtonState(component, true), { passive: true });
+        video.addEventListener('webkitendfullscreen', () => syncFullscreenButtonState(component, false), { passive: true });
         markReady();
+    }
+    // 组件清理：SPA 路由切换会把播放器组件从 DOM 摘除，定时器/observer 会残留并对新组件失效。
+    // 检测到 $el 脱离 DOM 时清干净并重新扫描新组件（借鉴原作者方案）
+    function cleanupComponent(component) {
+        if (!component) {
+            return;
+        }
+        if (component.__smgLoadingMonitor) {
+            clearInterval(component.__smgLoadingMonitor);
+            component.__smgLoadingMonitor = null;
+        }
+        if (component.__smgLoadingObserver) {
+            component.__smgLoadingObserver.disconnect();
+            component.__smgLoadingObserver = null;
+        }
+        if (component.pageVisibilityChange) {
+            document.removeEventListener('visibilitychange', component.pageVisibilityChange);
+        }
     }
     function startLoadingMonitor(component) {
         if (!component || component.__smgLoadingMonitor) {
             return;
         }
-        component.__smgLoadingMonitor = setInterval(() => syncLoadingState(component), 500);
+        component.__smgLoadingMonitor = setInterval(() => {
+            // $el 脱离 DOM 说明组件已被销毁，清理并转去补新组件
+            const rootEl = component.$el;
+            if (rootEl && !rootEl.isConnected) {
+                cleanupComponent(component);
+                initComponentPatch();
+                return;
+            }
+            syncLoadingState(component);
+        }, 500);
         if (component.$refs?.livePlayer && !component.__smgLoadingObserver) {
             component.__smgLoadingObserver = new MutationObserver(() => syncLoadingState(component));
             component.__smgLoadingObserver.observe(component.$refs.livePlayer, {
@@ -189,10 +324,7 @@
             document.querySelector('.live-player .xgplayer, .player-box .xgplayer, .xgplayer, .live-player, .player-box');
     }
     function syncFullscreenButtonState(component, isFullscreen) {
-        const player = component?.player;
-        if (player) {
-            player.fullscreen = !!isFullscreen;
-        }
+        // 只同步按钮 data-state，不直写 player.fullscreen（会与 iOS webkit 全屏态打架）
         document.querySelectorAll(FULLSCREEN_BUTTON_SELECTOR).forEach(button => {
             button.setAttribute('data-state', isFullscreen ? 'full' : 'normal');
         });
@@ -250,6 +382,21 @@
             return Promise.reject(e);
         }
     }
+    // iOS Safari 无元素级 Fullscreen API，用 video 原生 webkitEnterFullscreen 兜底
+    function enterNativeVideoFullscreen(component) {
+        const video = getPlayerVideo(component);
+        if (!video || typeof video.webkitEnterFullscreen !== 'function') {
+            return false;
+        }
+        try {
+            video.webkitEnterFullscreen();
+            syncFullscreenButtonState(component, true);
+            return true;
+        } catch (e) {
+            console.warn('[SMGTV] iOS 原生视频全屏失败，使用 CSS 兜底', e);
+            return false;
+        }
+    }
     function enterFullscreen(component, target) {
         const player = component?.player;
         const enterNative = callFullscreenMethod(() => (
@@ -259,7 +406,11 @@
         ));
         Promise.resolve(enterNative)
             .then(() => syncFullscreenButtonState(component, true))
-            .catch(() => enterFallbackFullscreen(target, component));
+            .catch(() => {
+                if (!enterNativeVideoFullscreen(component)) {
+                    enterFallbackFullscreen(target, component);
+                }
+            });
     }
     function exitFullscreen(component) {
         const player = component?.player;
@@ -298,8 +449,19 @@
         const component = findTVComponent();
         const target = getFullscreenTarget(component, button);
         syncLoadingState(component);
+        const video = getPlayerVideo(component);
         if (getBrowserFullscreenElement() || isFallbackFullscreen()) {
             exitFullscreen(component);
+        } else if (video && video.webkitDisplayingFullscreen) {
+            // iOS 原生视频全屏态的退出
+            try {
+                if (typeof video.webkitExitFullscreen === 'function') {
+                    video.webkitExitFullscreen();
+                }
+            } catch (e) {
+                console.warn('[SMGTV] 退出 iOS 原生全屏失败', e);
+            }
+            syncFullscreenButtonState(component, false);
         } else {
             enterFullscreen(component, target);
         }
@@ -442,9 +604,8 @@
             xhr.send();
         });
     }
-    // 回填直播流地址：频道级与节目级 live_address 均被服务器置空时，走 app 接口取加密地址补齐
-    // （F1 等被屏蔽节目的核心病根：initPlayer 拿到空 url 直接报错卡加载）
-    const liveAddressCache = new Map();
+    // 回填直播流地址：频道级与节目级 live_address 均被服务器置空时，优先用被动捕获缓存补齐，
+    // 无缓存再走 app 接口主动取流（F1 等被屏蔽节目的核心病根：initPlayer 拿到空 url 直接报错卡加载）
     async function refillLiveAddress(component) {
         if (!component || component.__smgRefilling) {
             return;
@@ -460,6 +621,14 @@
                 return;
             }
             let address = liveAddressCache.get(channelId);
+            if (!address) {
+                // 被动捕获的缓存（含 shift 兜底）优先，命中则免发请求
+                const passive = streamAddressCache[String(channelId)];
+                address = passive?.live_address || passive?.shift_address || '';
+                if (address) {
+                    liveAddressCache.set(channelId, address);
+                }
+            }
             if (!address) {
                 const res = await fetchChannelLiveAddress(channelId);
                 address = res?.result?.live_address || '';
@@ -506,6 +675,65 @@
     // 而页面后续 program/detail 响应会把 programDetail 整个替换回空地址对象
     function isLiveAddressEmpty(component) {
         return !component?.programDetail?.channel_info?.live_address;
+    }
+    // ===== 回看解锁（借鉴原作者方案）=====
+    // 原理：回看流的 m3u8 地址需要 start=节目开始时间&end=结束时间 的时间窗；
+    // 被屏蔽节目缺地址/缺时间窗时，用播放器实际用过的解密基址（带 TTL 缓存）+ 节目时间拼出
+    function stripTimeWindow(url) {
+        return url
+            .replace(/&start=\d+&end=\d+(?=&|$)/g, '')
+            .replace(/\?start=\d+&end=\d+(?=&|$)/g, '?')
+            .replace(/\?$/, '');
+    }
+    function installReplayUrlPatch(component) {
+        const XGPlayer = component.$xgplayer;
+        if (!XGPlayer || component.__smgReplayPatchInstalled) {
+            return;
+        }
+        component.__smgReplayPatchInstalled = true;
+        component.$xgplayer = new Proxy(XGPlayer, {
+            construct(target, args) {
+                const config = args[0] || {};
+                const program = component.programObj;
+                const channelId = component.currChannel?.id != null ? component.currChannel.id :
+                    (component.programDetail?.channel_info?.id != null ? component.programDetail.channel_info.id :
+                        program?.channel_id);
+                let url = (config.url && typeof config.url === 'string') ? config.url : '';
+                const now = Date.now();
+                // 播放器实际拿到过解密后的 m3u8：剥掉时间窗记下基址（shift 优先于 live，TTL 区分）
+                if (channelId != null && /\.m3u8/.test(url)) {
+                    const base = stripTimeWindow(url);
+                    if (base) {
+                        const fromShift = /[?&]start=\d+/.test(url);
+                        const store = fromShift ? channelShiftBaseCache : channelLiveBaseCache;
+                        store[channelId] = { url: base, at: now };
+                    }
+                }
+                // 回看但无流地址：用缓存基址 + 节目时间窗拼出回看地址
+                const shiftEntry = channelShiftBaseCache[channelId];
+                const liveEntry = channelLiveBaseCache[channelId];
+                const baseOk = (shiftEntry && now - shiftEntry.at < SHIFT_TTL) ? shiftEntry.url :
+                    ((liveEntry && now - liveEntry.at < LIVE_TTL) ? liveEntry.url : '');
+                const isReplay = config.isLive === false;
+                const hasStream = /\.m3u8/.test(url);
+                const hasWindow = /\bstart=\d/.test(url);
+                if (isReplay && hasWindow) {
+                    return new target(...args);
+                }
+                if (isReplay && hasStream && !hasWindow && program?.start_time && program?.end_time) {
+                    config.url = url + (url.includes('?') ? '&' : '?') +
+                        'start=' + program.start_time + '&end=' + program.end_time;
+                } else if (isReplay && !hasStream && program?.start_time && program?.end_time) {
+                    if (baseOk) {
+                        config.url = baseOk + '&start=' + program.start_time + '&end=' + program.end_time;
+                    }
+                } else if (!isReplay && !hasStream && baseOk) {
+                    // 直播但无流地址（服务器置空）：直接用缓存基址救活
+                    config.url = baseOk;
+                }
+                return new target(...args);
+            }
+        });
     }
     // 解除节目屏蔽字段：is_shield 控制是否创建播放器（isCopyright computed 依赖 programObj.is_shield）
     // 注意：只改权限字段，不动 play / isOutDate（它们是时间判断，乱改会误播未来节目或走错流地址分支）
@@ -567,10 +795,14 @@
             return;
         }
         component.__smgPatched = true;
-        // 首次校正：解除当前选中节目 / 详情的屏蔽状态
+        // 首次校正：解除当前选中节目 / 详情的屏蔽状态，并回补被置空的流地址
         unshieldProgram(component.programObj);
         unshieldProgram(component.playingProgramObj);
         unshieldProgram(component.programDetail);
+        if (component.programDetail?.channel_info) {
+            const channelId = component.programDetail.channel_info.id ?? component.currChannelDetail?.id;
+            fillStreamAddresses(component.programDetail.channel_info, channelId);
+        }
         if (typeof component.countdown === 'number') {
             component.countdown = 99999999;
         }
@@ -599,7 +831,9 @@
             window.removeEventListener('unload', component._handlerUnload);
             component._handlerUnload = null;
         }
-        ['initPlayer', 'initNoProgramPlayer', 'initPadPlayer', 'changeProgram', 'changeChannel'].forEach(methodName => {
+        // 回看解锁：Proxy 拦截 $xgplayer 构造，缺时间窗/基址时补齐
+        installReplayUrlPatch(component);
+        ['initPlayer', 'initNoProgramPlayer', 'initPadPlayer', 'changeProgram', 'changeChannel', 'getProgramDetail'].forEach(methodName => {
             wrapComponentMethod(component, methodName, syncLoadingState, (ctx, args) => {
                 // 原方法执行前校正屏蔽字段：
                 // - programObj：initPlayer 读取 isCopyright 时依赖 programObj.is_shield
@@ -619,19 +853,26 @@
         syncLoadingState(component);
         console.log('[SMGTV] 页面限制补丁已生效');
     }
+    let scanning = false;
     function initComponentPatch() {
+        if (scanning) {
+            return;
+        }
+        scanning = true;
         let attempts = 0;
         const maxAttempts = 50;
         const timer = setInterval(() => {
             const component = findTVComponent();
             if (component) {
                 clearInterval(timer);
+                scanning = false;
                 patchComponent(component);
                 return;
             }
             attempts += 1;
             if (attempts >= maxAttempts) {
                 clearInterval(timer);
+                scanning = false;
                 console.warn('[SMGTV] 未找到播放器组件实例');
             }
         }, 200);
@@ -705,6 +946,9 @@
     .${FULLSCREEN_TARGET_CLASS} .xg-top-bar {
         z-index: 2147483647 !important;
     }
+    .${FULLSCREEN_TARGET_CLASS} .xg-top-bar {
+        padding-top: env(safe-area-inset-top, 0px) !important;
+    }
     `);
     
     // 保存原始的XMLHttpRequest.open方法
@@ -717,64 +961,147 @@
             return String(url).includes('/content/pc/tv/');
         }
     }
+    // 统一的响应改写逻辑（XHR 与 fetch 共用，DRY）
+    function rewriteTvApiResponse(requestUrl, response) {
+        let modified = false;
+        if (!response || typeof response !== 'object') {
+            return false;
+        }
+        // 频道详情接口：被动记忆流地址（含 shift，回看/回补共用）
+        if (requestUrl.includes('/channel/detail') && response.result) {
+            rememberStreamAddresses(
+                response.result.id,
+                response.result.live_address,
+                response.result.shift_address
+            );
+        }
+        // 处理单个节目详情接口
+        if (requestUrl.includes('/program/detail') && response.result) {
+            unshieldProgram(response.result);
+            const info = response.result.channel_info || (response.result.channel_info = {});
+            unshieldProgram(info);
+            const channelId = info?.id ?? response.result.channel_id;
+            // 流地址被服务器置空时，直接把缓存地址写进响应（源头拦截，避免回填追赶竞态）
+            if (!info.live_address && channelId != null) {
+                if (liveAddressCache.has(channelId)) {
+                    info.live_address = liveAddressCache.get(channelId);
+                } else {
+                    fillStreamAddresses(info, channelId);
+                }
+                // 仍为空则异步预热（主动取流），之后页面重新拉详情/重建时即有地址可用
+                if (!info.live_address) {
+                    fetchChannelLiveAddress(channelId).then(res => {
+                        const addr = res?.result?.live_address || '';
+                        if (addr) liveAddressCache.set(channelId, addr);
+                    });
+                }
+            }
+            modified = true;
+        }
+        // 处理节目列表接口
+        if (requestUrl.includes('/programs') && response.result?.programs) {
+            response.result.programs.forEach(program => {
+                unshieldProgram(program);
+            });
+            modified = true;
+        }
+        return modified;
+    }
+    // 重写 XHR 响应属性（responseText + response，兼容 responseType=json）
+    function replaceXhrResponse(xhr, body) {
+        try {
+            Object.defineProperty(xhr, 'responseText', {
+                value: body,
+                writable: false,
+                configurable: true
+            });
+            Object.defineProperty(xhr, 'response', {
+                value: xhr.responseType === 'json' ? JSON.parse(body) : body,
+                writable: false,
+                configurable: true
+            });
+        } catch (e) {
+            throttleLog('rewrite-error', 5000, () => console.error('[SMGTV] 重写接口响应失败:', e));
+        }
+    }
     XMLHttpRequest.prototype.open = function(method, url) {
-        const requestUrl = String(url);
+        this.__smgRequestUrl = String(url);
         // 检查是否是目标API请求
-        if (isTargetTVApi(requestUrl)) {
-            // 监听readystatechange事件
-            this.addEventListener('readystatechange', function() {
-                if (this.readyState === 4 && this.status === 200) {
+        if (isTargetTVApi(this.__smgRequestUrl)) {
+            if (!this.__smgHooked) {
+                this.__smgHooked = true;
+                // 监听readystatechange事件
+                this.addEventListener('readystatechange', function() {
+                    if (this.readyState !== 4) {
+                        return;
+                    }
+                    const requestUrl = this.__smgRequestUrl;
                     try {
-                        // 解析响应数据
-                        const response = JSON.parse(this.responseText);
-                        let modified = false;
-
-                        // 处理单个节目详情接口
-                        if (requestUrl.includes('/program/detail') && response.result) {
-                            response.result.is_shield = 0;
-                            response.result.is_review = 1;
-                            response.result.can_review = 1;
-                            // 流地址被服务器置空时，直接把缓存的加密地址写进响应（源头拦截，避免回填追赶竞态）
-                            const info = response.result.channel_info;
-                            const channelId = info?.id;
-                            if (info && !info.live_address && channelId && liveAddressCache.has(channelId)) {
-                                info.live_address = liveAddressCache.get(channelId);
-                            } else if (info && !info.live_address && channelId) {
-                                // 缓存未暖：异步预热，之后页面重新拉详情/重建时即有地址可用
-                                fetchChannelLiveAddress(channelId).then(res => {
-                                    const addr = res?.result?.live_address || '';
-                                    if (addr) liveAddressCache.set(channelId, addr);
-                                });
-                            }
-                            modified = true;
+                        let response;
+                        let rawText = null;
+                        try {
+                            rawText = this.responseText;
+                        } catch (e) {
+                            rawText = null;
                         }
-                        // 处理节目列表接口
-                        if (requestUrl.includes('/programs') && response.result?.programs) {
-                            response.result.programs.forEach(program => {
-                                program.is_shield = 0;
-                                program.is_review = 1;
-                                program.can_review = 1;
-                                modified = true;
-                            });
+                        if (typeof rawText === 'string' && rawText) {
+                            response = JSON.parse(rawText);
+                        } else if (this.response && typeof this.response === 'object') {
+                            response = this.response;
+                        } else {
+                            return;
                         }
-
-                        if (modified) {
-                            // 重写responseText属性
-                            Object.defineProperty(this, 'responseText', {
-                                value: JSON.stringify(response),
-                                writable: false
-                            });
+                        if (this.status === 200 && rewriteTvApiResponse(requestUrl, response)) {
+                            replaceXhrResponse(this, JSON.stringify(response));
                         }
                     } catch (e) {
-                        console.error('解析JSON响应时出错:', e);
+                        throttleLog('parse-error', 5000, () => console.error('[SMGTV] 解析接口响应失败:', e));
                     }
-                }
-            });
+                });
+            }
         }
 
         // 调用原始的open方法
         return originalOpen.apply(this, arguments);
     };
+    // fetch 双 hook：页面部分请求走 fetch，同样改写 TV 接口响应
+    const originalFetch = window.fetch;
+    if (typeof originalFetch === 'function') {
+        window.fetch = function(input, init) {
+            const requestUrl = String(typeof input === 'string' ? input : (input && input.url) || '');
+            const request = originalFetch.apply(this, arguments);
+            if (!isTargetTVApi(requestUrl)) {
+                return request;
+            }
+            return request.then(res => {
+                if (!res || !res.ok) {
+                    return res;
+                }
+                try {
+                    return res.clone().text().then(raw => {
+                        try {
+                            const response = JSON.parse(raw);
+                            if (!rewriteTvApiResponse(requestUrl, response)) {
+                                return res;
+                            }
+                            return new Response(JSON.stringify(response), {
+                                status: res.status,
+                                statusText: res.statusText,
+                                headers: res.headers
+                            });
+                        } catch (e) {
+                            throttleLog('parse-error', 5000, () => console.error('[SMGTV] 解析接口响应失败:', e));
+                            return res;
+                        }
+                    }).catch(() => res);
+                } catch (e) {
+                    throttleLog('rewrite-error', 5000, () => console.error('[SMGTV] 重写接口响应失败:', e));
+                    return res;
+                }
+            });
+        };
+    }
+    ensureViewportFitCover();
     if (document.readyState === 'complete') {
         initComponentPatch();
     } else {
