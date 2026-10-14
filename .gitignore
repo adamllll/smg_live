@@ -3,3 +3,6 @@
 
 # Playwright MCP 调试快照
 .playwright-mcp/
+
+# Mimosa 安全钩子状态（本地会话产物，勿分发）
+.mimosa/
